@@ -6,6 +6,9 @@ import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+import { v4 as uuidv4 } from 'uuid';
 
 dotenv.config();
 
@@ -14,216 +17,226 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const LEADS_FILE = './leads.json';
-const STAFF_FILE = './staff.json';
+const JWT_SECRET = process.env.JWT_SECRET || 'yuvi-saas-super-secret-key';
+
+// "Database" Files
+const DB_PATH = './db';
+if (!fs.existsSync(DB_PATH)) fs.mkdirSync(DB_PATH);
+
+const FILES = {
+  COMPANIES: path.join(DB_PATH, 'companies.json'),
+  USERS: path.join(DB_PATH, 'users.json'),
+  LEADS: path.join(DB_PATH, 'leads.json'),
+  INVITES: path.join(DB_PATH, 'invites.json'),
+  TASKS: path.join(DB_PATH, 'tasks.json'),
+  ACTIVITIES: path.join(DB_PATH, 'activities.json')
+};
+
+// Initialize DB Files
+Object.values(FILES).forEach(file => {
+  if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify([], null, 2));
+});
+
+// Seed Super Admin if not exists
+const users = JSON.parse(fs.readFileSync(FILES.USERS));
+if (!users.find(u => u.role === 'SUPER_ADMIN')) {
+  const hashedPassword = bcrypt.hashSync('admin123', 10);
+  users.push({
+    id: 'super-admin-001',
+    name: 'Platform Admin',
+    email: 'admin@yuvicrm.com',
+    password: hashedPassword,
+    role: 'SUPER_ADMIN',
+    company_id: 'system'
+  });
+  fs.writeFileSync(FILES.USERS, JSON.stringify(users, null, 2));
+}
 
 app.use(cors());
 app.use(bodyParser.json());
-
-// Serve Static Frontend Files from "dist"
 app.use(express.static(path.join(__dirname, '../dist')));
 
-// Initialize files if they don't exist
-if (!fs.existsSync(LEADS_FILE)) {
-    fs.writeFileSync(LEADS_FILE, JSON.stringify([], null, 2));
-}
-if (!fs.existsSync(STAFF_FILE)) {
-    fs.writeFileSync(STAFF_FILE, JSON.stringify([
-        { name: 'Arun Kumar', active: true },
-        { name: 'Priya S', active: true },
-        { name: 'Mohan Raj', active: true }
-    ], null, 2));
-}
+// Helper: Data Access
+const read = (file) => JSON.parse(fs.readFileSync(file));
+const write = (file, data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
 
-const getLeads = () => JSON.parse(fs.readFileSync(LEADS_FILE));
-const saveLeads = (leads) => fs.writeFileSync(LEADS_FILE, JSON.stringify(leads, null, 2));
-
-const getStaff = () => JSON.parse(fs.readFileSync(STAFF_FILE));
-const saveStaff = (staff) => fs.writeFileSync(STAFF_FILE, JSON.stringify(staff, null, 2));
-
-let lastAssignedIndex = -1;
-
-const getNextOwner = (leadName) => {
-    const staff = getStaff().filter(s => s.active);
-    if (staff.length === 0) return 'Unassigned';
-
-    lastAssignedIndex = (lastAssignedIndex + 1) % staff.length;
-    const assignedStaff = staff[lastAssignedIndex];
-
-    // Auto-Notification
-    sendWhatsAppNotification(assignedStaff.name, assignedStaff.phone || '91XXXXXXXXXX', leadName);
-
-    return assignedStaff.name;
+// Middleware: Auth
+const authenticate = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Access denied' });
+  try {
+    const verified = jwt.verify(token, JWT_SECRET);
+    req.user = verified;
+    next();
+  } catch (err) {
+    res.status(400).json({ error: 'Invalid token' });
+  }
 };
 
-const sendWhatsAppNotification = (staffName, staffPhone, leadName) => {
-    const template = process.env.WA_ASSIGN_TEMPLATE || "Hi {staff}, you have a new lead: {lead}. Please follow up immediately!";
-    const message = template.replace('{staff}', staffName).replace('{lead}', leadName);
-
-    console.log(`\n🔔 [WHATSAPP AUTO-NOTIFICATION]`);
-    console.log(`To: ${staffName} (${staffPhone})`);
-    console.log(`Message: "${message}"\n`);
-
-    // To enable REAL WhatsApp sending:
-    // axios.post('YOUR_WA_API_URL', { phone: staffPhone, text: message });
+// Middleware: Role Check
+const authorize = (roles) => (req, res, next) => {
+  if (!roles.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Permission denied' });
+  }
+  next();
 };
 
-// 1. Meta (Facebook) Webhook Verification
-app.get('/webhooks/facebook', (req, res) => {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
+// --- AUTH API ---
 
-    if (mode && token) {
-        if (mode === 'subscribe' && token === process.env.FB_VERIFY_TOKEN) {
-            console.log('WEBHOOK_VERIFIED');
-            res.status(200).send(challenge);
-        } else {
-            res.sendStatus(403);
-        }
+app.post('/api/auth/login', (req, res) => {
+  const { email, password } = req.body;
+  const user = read(FILES.USERS).find(u => u.email === email);
+  if (!user || !bcrypt.compareSync(password, user.password)) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  const token = jwt.sign({ id: user.id, role: user.role, company_id: user.company_id, name: user.name }, JWT_SECRET, { expiresIn: '24h' });
+  res.json({ token, user: { id: user.id, name: user.name, role: user.role, company_id: user.company_id } });
+});
+
+// --- SUPER ADMIN API ---
+
+app.get('/api/super/companies', authenticate, authorize(['SUPER_ADMIN']), (req, res) => {
+  res.json(read(FILES.COMPANIES));
+});
+
+app.post('/api/super/companies', authenticate, authorize(['SUPER_ADMIN']), (req, res) => {
+  const { name, adminName, adminEmail, adminPassword } = req.body;
+  const companies = read(FILES.COMPANIES);
+  const companyId = uuidv4();
+
+  const newCompany = {
+    id: companyId,
+    name,
+    status: 'ACTIVE',
+    createdAt: new Date().toISOString()
+  };
+
+  const users = read(FILES.USERS);
+  users.push({
+    id: uuidv4(),
+    name: adminName,
+    email: adminEmail,
+    password: bcrypt.hashSync(adminPassword, 10),
+    role: 'COMPANY_ADMIN',
+    company_id: companyId
+  });
+
+  companies.push(newCompany);
+  write(FILES.COMPANIES, companies);
+  write(FILES.USERS, users);
+
+  res.json(newCompany);
+});
+
+// --- COMPANY ADMIN API (Invites) ---
+
+app.post('/api/company/invites', authenticate, authorize(['COMPANY_ADMIN']), (req, res) => {
+  const { email, role } = req.body;
+  const invites = read(FILES.INVITES);
+  const token = uuidv4();
+
+  const newInvite = {
+    token,
+    email,
+    role,
+    company_id: req.user.company_id,
+    used: false,
+    expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString() // 48h
+  };
+
+  invites.push(newInvite);
+  write(FILES.INVITES, invites);
+
+  // In real app, send email here
+  res.json({ inviteLink: `/register/${token}`, invite: newInvite });
+});
+
+app.get('/api/auth/invite/:token', (req, res) => {
+  const invite = read(FILES.INVITES).find(i => i.token === req.params.token && !i.used);
+  if (!invite) return res.status(404).json({ error: 'Invite not found or expired' });
+  res.json({ email: invite.email, role: invite.role });
+});
+
+app.post('/api/auth/register-invite', (req, res) => {
+  const { token, name, password } = req.body;
+  const invites = read(FILES.INVITES);
+  const inviteIndex = invites.findIndex(i => i.token === token && !i.used);
+
+  if (inviteIndex === -1) return res.status(400).json({ error: 'Invalid invite' });
+
+  const invite = invites[inviteIndex];
+  const users = read(FILES.USERS);
+
+  users.push({
+    id: uuidv4(),
+    name,
+    email: invite.email,
+    password: bcrypt.hashSync(password, 10),
+    role: invite.role,
+    company_id: invite.company_id
+  });
+
+  invites[inviteIndex].used = true;
+  write(FILES.USERS, users);
+  write(FILES.INVITES, invites);
+
+  res.json({ success: true });
+});
+
+// --- TENANT DATA API ---
+
+app.get('/api/leads', authenticate, (req, res) => {
+  let leads = read(FILES.LEADS);
+  if (req.user.role !== 'SUPER_ADMIN') {
+    leads = leads.filter(l => l.company_id === req.user.company_id);
+    // Managers see all company leads, others see assigned
+    if (['SALES_EXECUTIVE', 'TELECALLER'].includes(req.user.role)) {
+      leads = leads.filter(l => l.assigned_to === req.user.id);
     }
+  }
+  res.json(leads);
 });
 
-// 2. Meta (Facebook) Webhook Lead Event
-app.post('/webhooks/facebook', async (req, res) => {
-    const body = req.body;
-
-    if (body.object === 'page') {
-        body.entry.forEach(async (entry) => {
-            const leadgenEvent = entry.changes.find(change => change.field === 'leadgen');
-            if (leadgenEvent) {
-                const leadId = leadgenEvent.value.leadgen_id;
-                console.log(`New Meta Lead ID: ${leadId}`);
-
-                // Fetch lead details using Meta Graph API
-                try {
-                    const response = await axios.get(`https://graph.facebook.com/v19.0/${leadId}?access_token=${process.env.FB_PAGE_ACCESS_TOKEN}`);
-                    const leadData = response.data;
-
-                    // Format the lead to match CRM structure
-                    const newLead = {
-                        id: Date.now(),
-                        name: leadData.field_data.find(f => f.name === 'full_name')?.values[0] || 'Unknown Meta Lead',
-                        phone: leadData.field_data.find(f => f.name === 'phone_number')?.values[0] || '',
-                        email: leadData.field_data.find(f => f.name === 'email')?.values[0] || '',
-                        sqft: leadData.field_data.find(f => f.name === 'sqft' || f.name === 'area')?.values[0] || '',
-                        project: 'Meta Lead Ads',
-                        source: 'Meta Lead Ads',
-                        status: 'New Lead',
-                        owner: getNextOwner(),
-                        budget: 'TBD',
-                        next: 'Not set',
-                        temp: 'Warm',
-                        notes: `Meta Campaign: ${leadData.ad_name || 'N/A'}`
-                    };
-
-                    const leads = getLeads();
-                    leads.unshift(newLead);
-                    saveLeads(leads);
-
-                } catch (error) {
-                    console.error('Error fetching Meta lead details:', error.message);
-                }
-            }
-        });
-        res.status(200).send('EVENT_RECEIVED');
-    } else {
-        res.sendStatus(404);
-    }
+app.post('/api/leads', authenticate, (req, res) => {
+  const leads = read(FILES.LEADS);
+  const newLead = {
+    ...req.body,
+    id: uuidv4(),
+    company_id: req.user.company_id,
+    created_by: req.user.id,
+    createdAt: new Date().toISOString()
+  };
+  leads.push(newLead);
+  write(FILES.LEADS, leads);
+  res.json(newLead);
 });
 
-// 3. Google Ads Webhook
-app.post('/webhooks/google', (req, res) => {
-    const { google_key, ...leadData } = req.body;
+// Webhooks (Multi-tenant)
+app.post('/webhooks/google/:company_id', (req, res) => {
+  const { company_id } = req.params;
+  const leadData = req.body;
+  const leads = read(FILES.LEADS);
 
-    if (google_key !== process.env.GOOGLE_WEBHOOK_KEY) {
-        return res.status(403).send('Invalid Key');
-    }
+  const newLead = {
+    id: uuidv4(),
+    company_id,
+    name: leadData.full_name || 'Google Lead',
+    phone: leadData.phone_number || '',
+    source: 'Google Ads',
+    status: 'New Lead'
+  };
 
-    const newLead = {
-        id: Date.now(),
-        name: leadData.full_name || 'Google Lead',
-        phone: leadData.phone_number || '',
-        email: leadData.email || '',
-        sqft: leadData.sqft || leadData.area_required || '',
-        project: 'Google Ads',
-        source: 'Google Ads',
-        status: 'New Lead',
-        owner: getNextOwner(),
-        budget: 'TBD',
-        next: 'Not set',
-        temp: 'Warm',
-        notes: `Google Campaign: ${leadData.campaign_id || 'N/A'}`
-    };
-
-    const leads = getLeads();
-    leads.unshift(newLead);
-    saveLeads(leads);
-
-    res.status(200).send('SUCCESS');
+  leads.push(newLead);
+  write(FILES.LEADS, leads);
+  res.sendStatus(200);
 });
 
-// 4. Update Lead (for assignment)
-app.put('/api/leads/:id', (req, res) => {
-    const { id } = req.params;
-    const updateData = req.body;
-    let leads = getLeads();
-    const index = leads.findIndex(l => l.id == id);
-    if (index !== -1) {
-        leads[index] = { ...leads[index], ...updateData };
-        saveLeads(leads);
-        res.json(leads[index]);
-    } else {
-        res.status(404).send('Lead not found');
-    }
-});
-
-// 5. API for Staff
-app.get('/api/staff', (req, res) => {
-    res.json(getStaff());
-});
-
-app.put('/api/staff/:name', (req, res) => {
-    const { name } = req.params;
-    const { active } = req.body;
-    let staff = getStaff();
-    const index = staff.findIndex(s => s.name === name);
-    if (index !== -1) {
-        staff[index].active = active;
-        saveStaff(staff);
-        res.json(staff[index]);
-    } else {
-        res.status(404).send('Staff member not found');
-    }
-});
-
-app.post('/api/staff', (req, res) => {
-    const { name } = req.body;
-    let staff = getStaff();
-    if (!staff.find(s => s.name === name)) {
-        staff.push({ name, active: true });
-        saveStaff(staff);
-    }
-    res.json(staff);
-});
-
-app.delete('/api/staff/:name', (req, res) => {
-    const { name } = req.params;
-    let staff = getStaff().filter(s => s.name !== name);
-    saveStaff(staff);
-    res.json({ success: true });
-});
-
-// 6. API for CRM Frontend to get leads
-app.get('/api/leads', (req, res) => {
-    res.json(getLeads());
-});
-
-// 7. Wildcard route to serve index.html for React Router (SPA)
+// Wildcard for SPA
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../dist/index.html'));
+  res.sendFile(path.join(__dirname, '../dist/index.html'));
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Yuvi CRM Backend running on http://localhost:${PORT}`);
+  console.log(`🚀 Yuvi SaaS Backend running on port ${PORT}`);
 });
