@@ -1,0 +1,7 @@
+[
+  { "name": "Arun Kumar", "active": true },
+  { "name": "Priya S", "active": true },
+  { "name": "Mohan Raj", "active": true },
+  { "name": "Divya K", "active": false },
+  { "name": "Sathish M", "active": false }
+]
