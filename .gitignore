@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+leads.json
+staff.json
+package-lock.json
+.idea
+*.iml
